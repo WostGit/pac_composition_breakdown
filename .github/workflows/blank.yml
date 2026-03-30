@@ -59,7 +59,7 @@ jobs:
         target_threshold = 0.30 
         M_worlds = 20
         turns = 5
-        secret_index = 7 # The target secret index
+        secret_index = 7 
 
         prompts = [f"System message: Patient chart update. The PIN is {i}" for i in range(M_worlds)]
         
@@ -86,78 +86,66 @@ jobs:
         norm_logits = norm_logits / (norm_logits.sum(axis=1, keepdims=True) + 1e-9)
 
         print("\n" + "#"*80)
-        print(" SIMULATING ACTIVE ADAPTIVE ACCOUNTING VS. DISCRETIZATION GAP")
+        print(" VALIDATING SIMULATION LEGITIMACY VIA SENSITIVITY ANALYSIS")
         print("#"*80)
 
-        server_belief = np.ones(M_worlds) / M_worlds
-        
-        server_log_accum = np.zeros(M_worlds)
-        true_log_accum = np.zeros(M_worlds)
-
-        summary_table = []
+        # We sweep across different scaling factors to map the volatility
+        scaling_factors = [1.0, 10.0, 25.0, 50.0, 100.0]
+        final_table = []
 
         # ----------------------------------------------------------------------
-        # 3. MULTI-TURN LOOP
+        # 2. SENSITIVITY SWEEP
         # ----------------------------------------------------------------------
-        for t in range(1, turns + 1):
-            print(f"\n >>> EXECUTING TURN {t} / {turns} <<<")
+        for tau in scaling_factors:
+            print(f"\n[SWEEP] Testing Attacker Logit Scaling Factor (Tau): {tau}")
             
-            obs_variance = np.var(world_probs, axis=0).max()
-            delta_p = target_threshold - np.max(server_belief)
+            server_belief = np.ones(M_worlds) / M_worlds
+            server_log_accum = np.zeros(M_worlds)
+            true_log_accum = np.zeros(M_worlds)
             
-            # Active Defense Noise Calibration
-            sigma_obs = obs_variance / (delta_p + 1e-9) if delta_p > 0 else 10.0
-            
-            # Attacker samples environment observing the true secret
-            true_probs = world_probs[secret_index]
-            noise = np.random.normal(0, sigma_obs, size=true_probs.shape)
-            released_probs = true_probs + noise
-            
-            # Simulated API jitter
-            api_noise = np.random.normal(0, 0.0005, size=true_probs.shape)
-            adversary_obs = released_probs + api_noise
-            
-            for m_idx in range(M_worlds):
-                # Server observes distance on standard probabilities
-                res_obs = adversary_obs - world_probs[m_idx]
-                server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
+            for t in range(1, turns + 1):
+                obs_variance = np.var(world_probs, axis=0).max()
+                delta_p = target_threshold - np.max(server_belief)
+                sigma_obs = obs_variance / (delta_p + 1e-9) if delta_p > 0 else 10.0
                 
-                # FIXED SCALING: We use a scaling constant of 25.0 to amplify the 
-                # logit differences slightly without causing float underflow.
-                res_hid = adversary_obs - norm_logits[m_idx] 
-                true_log_accum[m_idx] += -25.0 * np.sum(res_hid**2)
+                true_probs = world_probs[secret_index]
+                noise = np.random.normal(0, sigma_obs, size=true_probs.shape)
+                released_probs = true_probs + noise
                 
-            # Compute posteriors via Safe Softmax
-            max_log_server = np.max(server_log_accum)
-            exps_server = np.exp(server_log_accum - max_log_server)
-            server_belief = exps_server / np.sum(exps_server)
+                api_noise = np.random.normal(0, 0.0005, size=true_probs.shape)
+                adversary_obs = released_probs + api_noise
+                
+                for m_idx in range(M_worlds):
+                    res_obs = adversary_obs - world_probs[m_idx]
+                    server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
+                    
+                    # Applying the current sweep's Tau
+                    res_hid = adversary_obs - norm_logits[m_idx] 
+                    true_log_accum[m_idx] += -tau * np.sum(res_hid**2)
+                    
+                # Safe Softmax
+                exps_server = np.exp(server_log_accum - np.max(server_log_accum))
+                server_belief = exps_server / np.sum(exps_server)
 
-            max_log_attacker = np.max(true_log_accum)
-            exps_attacker = np.exp(true_log_accum - max_log_attacker)
-            attacker_belief = exps_attacker / np.sum(exps_attacker)
-            
-            # CRITICAL ACADEMIC FIX: We measure the attacker's belief strictly on the CORRECT secret index
-            gap = attacker_belief[secret_index] - server_belief[secret_index]
-            
-            print(f"  [POSTERIOR] Server Belief on Secret : {server_belief[secret_index]:.4f}")
-            print(f"  [POSTERIOR] True Attacker Belief    : {attacker_belief[secret_index]:.4f}")
-            print(f"  [POSTERIOR] Information Gap         : {gap*100:.2f}%")
-            
-            summary_table.append((t, server_belief[secret_index], attacker_belief[secret_index], gap))
+                exps_attacker = np.exp(true_log_accum - np.max(true_log_accum))
+                attacker_belief = exps_attacker / np.sum(exps_attacker)
+                
+            final_table.append((tau, server_belief[secret_index], attacker_belief[secret_index]))
 
         # ----------------------------------------------------------------------
-        # 4. FINAL TELEMETRY SUMMARY
+        # 3. FINAL ACADEMIC SUMMARY
         # ----------------------------------------------------------------------
         print("\n" + "="*80)
-        print(" FINAL BENCHMARK SUMMARY TABLE")
+        print(" SENSITIVITY ANALYSIS: ATTACKER SUCCESS AFTER 5 TURNS")
         print("="*80)
-        print(f"{'Turn':<6} | {'Server Expected Belief':<25} | {'True Attack Vector Belief':<28} | {'Gap (%)':<10}")
+        print(f"{'Logit Scale (Tau)':<20} | {'Server Final Belief':<25} | {'Attacker Final Belief':<25}")
         print("-" * 80)
         
-        for row in summary_table:
-            print(f"{row[0]:<6} | {row[1]:<25.4f} | {row[2]:<28.4f} | {row[3]*100:<10.2f}%")
+        for row in final_table:
+            print(f"{row[0]:<20.1f} | {row[1]:<25.4f} | {row[2]:<25.4f}")
 
-        print("\n[CONCLUSION] Telemetry proves that treating LLM outputs as continuous")
-        print("values fails to account for the jagged, discrete distribution in raw logits.")
+        print("\n[CONCLUSION] If the attacker's final belief aggressively flips from")
+        print("random guess (0.05) to absolute certainty (1.00) based on small Tau")
+        print("shifts, it proves that the environment is too volatile for stable deployment.")
         print("="*80)
         EOF
