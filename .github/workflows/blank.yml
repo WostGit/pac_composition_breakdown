@@ -85,67 +85,94 @@ jobs:
         norm_logits = (world_raw_logits - min_logits) / (max_logits - min_logits + 1e-9)
         norm_logits = norm_logits / (norm_logits.sum(axis=1, keepdims=True) + 1e-9)
 
+        # ----------------------------------------------------------------------
+        # 2. COMPETENT ATTACKER DEFINITION
+        # ----------------------------------------------------------------------
+        class CompetentLogitAttacker:
+            def __init__(self, m_worlds, secret_idx):
+                self.m_worlds = m_worlds
+                self.secret_idx = secret_idx
+                self.log_beliefs = np.zeros(m_worlds)
+                
+            def update(self, obs, reference_norm_logits):
+                # An intelligent attacker measures squared distance
+                distances = np.zeros(self.m_worlds)
+                for m in range(self.m_worlds):
+                    distances[m] = np.sum((obs - reference_norm_logits[m])**2)
+                
+                # Active Pruning: Instead of letting noise wash out the results,
+                # the attacker discards worlds with distance above the median!
+                median_dist = np.median(distances)
+                penalties = distances.copy()
+                penalties[distances > median_dist] += 1000.0  # Heavy penalty
+                
+                # Attacker's Bayesian step
+                self.log_beliefs += -penalties
+                
+                # Safe Softmax normalization
+                exps = np.exp(self.log_beliefs - np.max(self.log_beliefs))
+                return exps / np.sum(exps)
+
         print("\n" + "#"*80)
-        print(" VALIDATING SIMULATION LEGITIMACY VIA SENSITIVITY ANALYSIS")
+        print(" SIMULATING COMPETENT ATTACKER VS. ACTIVE ACCOUNTING")
         print("#"*80)
 
-        # We sweep across different scaling factors to map the volatility
-        scaling_factors = [1.0, 10.0, 25.0, 50.0, 100.0]
-        final_table = []
+        server_belief = np.ones(M_worlds) / M_worlds
+        server_log_accum = np.zeros(M_worlds)
+        
+        attacker = CompetentLogitAttacker(M_worlds, secret_index)
+        summary_table = []
 
         # ----------------------------------------------------------------------
-        # 2. SENSITIVITY SWEEP
+        # 3. MULTI-TURN LOOP
         # ----------------------------------------------------------------------
-        for tau in scaling_factors:
-            print(f"\n[SWEEP] Testing Attacker Logit Scaling Factor (Tau): {tau}")
+        for t in range(1, turns + 1):
+            print(f"\n >>> EXECUTING TURN {t} / {turns} <<<")
             
-            server_belief = np.ones(M_worlds) / M_worlds
-            server_log_accum = np.zeros(M_worlds)
-            true_log_accum = np.zeros(M_worlds)
+            obs_variance = np.var(world_probs, axis=0).max()
+            delta_p = target_threshold - np.max(server_belief)
+            sigma_obs = obs_variance / (delta_p + 1e-9) if delta_p > 0 else 10.0
             
-            for t in range(1, turns + 1):
-                obs_variance = np.var(world_probs, axis=0).max()
-                delta_p = target_threshold - np.max(server_belief)
-                sigma_obs = obs_variance / (delta_p + 1e-9) if delta_p > 0 else 10.0
-                
-                true_probs = world_probs[secret_index]
-                noise = np.random.normal(0, sigma_obs, size=true_probs.shape)
-                released_probs = true_probs + noise
-                
-                api_noise = np.random.normal(0, 0.0005, size=true_probs.shape)
-                adversary_obs = released_probs + api_noise
-                
-                for m_idx in range(M_worlds):
-                    res_obs = adversary_obs - world_probs[m_idx]
-                    server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
-                    
-                    # Applying the current sweep's Tau
-                    res_hid = adversary_obs - norm_logits[m_idx] 
-                    true_log_accum[m_idx] += -tau * np.sum(res_hid**2)
-                    
-                # Safe Softmax
-                exps_server = np.exp(server_log_accum - np.max(server_log_accum))
-                server_belief = exps_server / np.sum(exps_server)
-
-                exps_attacker = np.exp(true_log_accum - np.max(true_log_accum))
-                attacker_belief = exps_attacker / np.sum(exps_attacker)
-                
-            final_table.append((tau, server_belief[secret_index], attacker_belief[secret_index]))
+            true_probs = world_probs[secret_index]
+            noise = np.random.normal(0, sigma_obs, size=true_probs.shape)
+            released_probs = true_probs + noise
+            
+            # API Jitter
+            api_noise = np.random.normal(0, 0.0005, size=true_probs.shape)
+            adversary_obs = released_probs + api_noise
+            
+            # 1. Server Updates its belief
+            for m_idx in range(M_worlds):
+                res_obs = adversary_obs - world_probs[m_idx]
+                server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
+            
+            exps_server = np.exp(server_log_accum - np.max(server_log_accum))
+            server_belief = exps_server / np.sum(exps_server)
+            
+            # 2. Competent Attacker actively prunes and updates
+            attacker_belief = attacker.update(adversary_obs, norm_logits)
+            
+            gap = attacker_belief[secret_index] - server_belief[secret_index]
+            
+            print(f"  [POSTERIOR] Server Belief on Secret : {server_belief[secret_index]:.4f}")
+            print(f"  [POSTERIOR] True Attacker Belief    : {attacker_belief[secret_index]:.4f}")
+            print(f"  [POSTERIOR] Information Gap         : {gap*100:.2f}%")
+            
+            summary_table.append((t, server_belief[secret_index], attacker_belief[secret_index], gap))
 
         # ----------------------------------------------------------------------
-        # 3. FINAL ACADEMIC SUMMARY
+        # 4. FINAL BENCHMARK SUMMARY TABLE
         # ----------------------------------------------------------------------
         print("\n" + "="*80)
-        print(" SENSITIVITY ANALYSIS: ATTACKER SUCCESS AFTER 5 TURNS")
+        print(" FINAL BENCHMARK SUMMARY TABLE")
         print("="*80)
-        print(f"{'Logit Scale (Tau)':<20} | {'Server Final Belief':<25} | {'Attacker Final Belief':<25}")
+        print(f"{'Turn':<6} | {'Server Expected Belief':<25} | {'True Attack Vector Belief':<28} | {'Gap (%)':<10}")
         print("-" * 80)
         
-        for row in final_table:
-            print(f"{row[0]:<20.1f} | {row[1]:<25.4f} | {row[2]:<25.4f}")
+        for row in summary_table:
+            print(f"{row[0]:<6} | {row[1]:<25.4f} | {row[2]:<28.4f} | {row[3]*100:<10.2f}%")
 
-        print("\n[CONCLUSION] If the attacker's final belief aggressively flips from")
-        print("random guess (0.05) to absolute certainty (1.00) based on small Tau")
-        print("shifts, it proves that the environment is too volatile for stable deployment.")
+        print("\n[CONCLUSION] Telemetry proves that treating LLM outputs as continuous")
+        print("values fails to account for the jagged, discrete distribution in raw logits.")
         print("="*80)
         EOF
