@@ -22,7 +22,6 @@ jobs:
         python-version: '3.11'
 
     - name: "Step 3: Setup Hugging Face Cache"
-      id: cache-hf
       uses: actions/cache@v4
       with:
         path: ~/.cache/huggingface
@@ -49,6 +48,9 @@ jobs:
         print(" CRITIQUE: ZHU ET AL. (2026) POSTERIOR-AWARE COMPOSITION STRESS TEST")
         print("="*80)
 
+        # ----------------------------------------------------------------------
+        # 1. MODEL INITIALIZATION & LOGIT EXTRACTION
+        # ----------------------------------------------------------------------
         model_id = "Qwen/Qwen2-0.5B-Instruct"
         print(f"[VERBOSE] Pulling {model_id} from Hugging Face...")
         model, tokenizer = load(model_id)
@@ -88,52 +90,67 @@ jobs:
         print("#"*80)
 
         server_belief = np.ones(M_worlds) / M_worlds
-        true_adversary_belief = np.ones(M_worlds) / M_worlds
-
-        def safe_softmax(logs):
-            max_log = np.max(logs)
-            exps = np.exp(logs - max_log)
-            return exps / np.sum(exps)
-
-        server_log_accum = np.zeros(M_worlds)
-        true_log_accum = np.zeros(M_worlds)
+        
+        # Track raw Euclidean distances cumulatively
+        server_dist_accum = np.zeros(M_worlds)
+        attacker_dist_accum = np.zeros(M_worlds)
 
         summary_table = []
 
+        # ----------------------------------------------------------------------
+        # 3. MULTI-TURN LOOP
+        # ----------------------------------------------------------------------
         for t in range(1, turns + 1):
             print(f"\n >>> EXECUTING TURN {t} / {turns} <<<")
             
             obs_variance = np.var(world_probs, axis=0).max()
-            
             delta_p = target_threshold - np.max(server_belief)
+            
+            # Active Defense Noise Calibration
             sigma_obs = obs_variance / (delta_p + 1e-9) if delta_p > 0 else 10.0
             
+            # Attacker samples environment observing the true secret
             true_probs = world_probs[secret_index]
             noise = np.random.normal(0, sigma_obs, size=true_probs.shape)
             released_probs = true_probs + noise
             
+            # Simulated API jitter
             api_noise = np.random.normal(0, 0.0005, size=true_probs.shape)
             adversary_obs = released_probs + api_noise
             
-            for m_idx in range(M_worlds):
-                # Server observes distance on standard probabilities
-                res_obs = adversary_obs - world_probs[m_idx]
-                server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
-                
-                # FIXED: Simple distance without sigma_hidden division prevents underflow
-                res_hid = adversary_obs - norm_logits[m_idx] 
-                true_log_accum[m_idx] += -np.sum(res_hid**2)
-                
-            server_belief = safe_softmax(server_log_accum)
-            true_adversary_belief = safe_softmax(true_log_accum)
+            print(f"  [MATH] Calculated Server Noise Sigma: {sigma_obs:.6f}")
             
-            gap = true_adversary_belief[secret_index] - server_belief[secret_index]
+            for m_idx in range(M_worlds):
+                # 1. Server distance (based on released probabilities)
+                res_obs = adversary_obs - world_probs[m_idx]
+                server_dist_accum[m_idx] += np.sum(res_obs**2)
+                
+                # 2. Attacker distance (based on raw scaled logits)
+                res_hid = adversary_obs - norm_logits[m_idx] 
+                attacker_dist_accum[m_idx] += np.sum(res_hid**2)
+                
+            # To simulate "Belief" safely without exponentials, we invert the distance.
+            # A smaller distance to a world means a HIGHER likelihood score.
+            # We use 1 / (distance + small epsilon) to convert distance to a score.
+            server_scores = 1.0 / (server_dist_accum + 1e-9)
+            attacker_scores = 1.0 / (attacker_dist_accum + 1e-9)
+            
+            # Normalize scores to look like a clean probability distribution
+            server_belief = server_scores / np.sum(server_scores)
+            attacker_belief = attacker_scores / np.sum(attacker_scores)
+            
+            # Calculate the Gap (Attacker certainty vs Server certainty on the secret)
+            gap = attacker_belief[secret_index] - server_belief[secret_index]
             
             print(f"  [POSTERIOR] Server Belief on Secret : {server_belief[secret_index]:.4f}")
-            print(f"  [POSTERIOR] True Attacker Belief    : {true_adversary_belief[secret_index]:.4f}")
+            print(f"  [POSTERIOR] True Attacker Belief    : {attacker_belief[secret_index]:.4f}")
+            print(f"  [POSTERIOR] Information Gap         : {gap*100:.2f}%")
             
-            summary_table.append((t, server_belief[secret_index], true_adversary_belief[secret_index], gap))
+            summary_table.append((t, server_belief[secret_index], attacker_belief[secret_index], gap))
 
+        # ----------------------------------------------------------------------
+        # 4. FINAL TELEMETRY SUMMARY
+        # ----------------------------------------------------------------------
         print("\n" + "="*80)
         print(" FINAL BENCHMARK SUMMARY TABLE")
         print("="*80)
