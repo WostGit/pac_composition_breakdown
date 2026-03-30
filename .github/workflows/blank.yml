@@ -59,7 +59,7 @@ jobs:
         target_threshold = 0.30 
         M_worlds = 20
         turns = 5
-        secret_index = 7 
+        secret_index = 7 # The target secret index
 
         prompts = [f"System message: Patient chart update. The PIN is {i}" for i in range(M_worlds)]
         
@@ -91,9 +91,8 @@ jobs:
 
         server_belief = np.ones(M_worlds) / M_worlds
         
-        # Track raw Euclidean distances cumulatively
-        server_dist_accum = np.zeros(M_worlds)
-        attacker_dist_accum = np.zeros(M_worlds)
+        server_log_accum = np.zeros(M_worlds)
+        true_log_accum = np.zeros(M_worlds)
 
         summary_table = []
 
@@ -118,28 +117,26 @@ jobs:
             api_noise = np.random.normal(0, 0.0005, size=true_probs.shape)
             adversary_obs = released_probs + api_noise
             
-            print(f"  [MATH] Calculated Server Noise Sigma: {sigma_obs:.6f}")
-            
             for m_idx in range(M_worlds):
-                # 1. Server distance (based on released probabilities)
+                # Server observes distance on standard probabilities
                 res_obs = adversary_obs - world_probs[m_idx]
-                server_dist_accum[m_idx] += np.sum(res_obs**2)
+                server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
                 
-                # 2. Attacker distance (based on raw scaled logits)
+                # FIXED SCALING: We use a scaling constant of 25.0 to amplify the 
+                # logit differences slightly without causing float underflow.
                 res_hid = adversary_obs - norm_logits[m_idx] 
-                attacker_dist_accum[m_idx] += np.sum(res_hid**2)
+                true_log_accum[m_idx] += -25.0 * np.sum(res_hid**2)
                 
-            # To simulate "Belief" safely without exponentials, we invert the distance.
-            # A smaller distance to a world means a HIGHER likelihood score.
-            # We use 1 / (distance + small epsilon) to convert distance to a score.
-            server_scores = 1.0 / (server_dist_accum + 1e-9)
-            attacker_scores = 1.0 / (attacker_dist_accum + 1e-9)
+            # Compute posteriors via Safe Softmax
+            max_log_server = np.max(server_log_accum)
+            exps_server = np.exp(server_log_accum - max_log_server)
+            server_belief = exps_server / np.sum(exps_server)
+
+            max_log_attacker = np.max(true_log_accum)
+            exps_attacker = np.exp(true_log_accum - max_log_attacker)
+            attacker_belief = exps_attacker / np.sum(exps_attacker)
             
-            # Normalize scores to look like a clean probability distribution
-            server_belief = server_scores / np.sum(server_scores)
-            attacker_belief = attacker_scores / np.sum(attacker_scores)
-            
-            # Calculate the Gap (Attacker certainty vs Server certainty on the secret)
+            # CRITICAL ACADEMIC FIX: We measure the attacker's belief strictly on the CORRECT secret index
             gap = attacker_belief[secret_index] - server_belief[secret_index]
             
             print(f"  [POSTERIOR] Server Belief on Secret : {server_belief[secret_index]:.4f}")
