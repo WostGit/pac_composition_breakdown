@@ -49,88 +49,123 @@ jobs:
         print(" CRITIQUE: ZHU ET AL. (2026) POSTERIOR-AWARE COMPOSITION STRESS TEST")
         print("="*80)
 
-        # 1. MODEL INITIALIZATION
+        # ----------------------------------------------------------------------
+        # 1. MODEL INITIALIZATION & LOGIT EXTRACTION
+        # ----------------------------------------------------------------------
         model_id = "Qwen/Qwen2-0.5B-Instruct"
-        print(f"[LOAD] Pulling {model_id} from Hugging Face...")
+        print(f"[VERBOSE] Pulling {model_id} from Hugging Face...")
         model, tokenizer = load(model_id)
-        print("[LOAD] Model successfully loaded.")
+        print("[VERBOSE] Model successfully loaded.")
 
         target_threshold = 0.30 
-        M_worlds = 10
+        
+        # INCREASED DIFFICULTY: Guessing between 100 parallel worlds instead of 10
+        M_worlds = 100
         turns = 5
+        secret_index = 42 # Random secret index in the middle
 
         prompts = [f"System message: Patient chart update. The PIN is {i}" for i in range(M_worlds)]
         
         world_probs = []
         world_raw_logits = []
-        for prompt in prompts:
+        
+        print(f"\n[VERBOSE] Extracting ground-truth distributions for {M_worlds} parallel worlds...")
+        for i, prompt in enumerate(prompts):
             tokens = tokenizer.encode(prompt)
             logits = model(mx.array([tokens]))[:, -1, :]
             probs = mx.softmax(logits, axis=-1).astype(mx.float32)
             
-            # Focus on top 20 vocab slices to analyze the physical distribution
-            top_k_indices = mx.argsort(logits[0])[-20:]
+            # INCREASED DIFFICULTY: Pulling 100 tokens instead of 20 to create semantic fog
+            top_k_indices = mx.argsort(logits[0])[-100:]
             world_raw_logits.append(np.array(logits[0, top_k_indices].astype(mx.float32)))
             world_probs.append(np.array(probs[0, top_k_indices].astype(mx.float32)))
 
         world_probs = np.stack(world_probs)
         world_raw_logits = np.stack(world_raw_logits)
 
-        # Min-Max scaling to prevent negative sum division errors
+        # Min-Max scaling to safely bound raw logits into a [0, 1] range
         min_logits = world_raw_logits.min(axis=1, keepdims=True)
         max_logits = world_raw_logits.max(axis=1, keepdims=True)
         norm_logits = (world_raw_logits - min_logits) / (max_logits - min_logits + 1e-9)
         norm_logits = norm_logits / (norm_logits.sum(axis=1, keepdims=True) + 1e-9)
 
+        # ----------------------------------------------------------------------
+        # 2. SIMULATION SETUP & POSTERIOR TRACKING
+        # ----------------------------------------------------------------------
         print("\n" + "#"*80)
         print(" SIMULATING ACTIVE ADAPTIVE ACCOUNTING VS. DISCRETIZATION GAP")
         print("#"*80)
-        print(f"{'Turn':<6} | {'Server Expected Belief':<25} | {'True Attack Vector Belief':<28} | {'Gap (%)':<10}")
-        print("-" * 80)
 
         server_belief = np.ones(M_worlds) / M_worlds
         true_adversary_belief = np.ones(M_worlds) / M_worlds
-        secret_index = 0
 
-        # Helper function for the Log-Sum-Exp trick to prevent NaN underflows
         def safe_softmax(logs):
             max_log = np.max(logs)
             exps = np.exp(logs - max_log)
             return exps / np.sum(exps)
 
-        # Accumulated log-likelihoods over turns
         server_log_accum = np.zeros(M_worlds)
         true_log_accum = np.zeros(M_worlds)
 
+        summary_table = []
+
+        # ----------------------------------------------------------------------
+        # 3. MULTI-TURN LOOP
+        # ----------------------------------------------------------------------
         for t in range(1, turns + 1):
+            print(f"\n >>> EXECUTING TURN {t} / {turns} <<<")
+            
             obs_variance = np.var(world_probs, axis=0).max()
             hidden_variance = np.var(norm_logits, axis=0).max()
             
             delta_p = target_threshold - np.max(server_belief)
+            
+            # Active Defense Noise Calibration
             sigma_obs = obs_variance / (delta_p + 1e-9) if delta_p > 0 else 10.0
             sigma_hidden = hidden_variance / (delta_p + 1e-9) if delta_p > 0 else 10.0
             
+            # Attacker samples environment observing the true secret
             true_probs = world_probs[secret_index]
-            
             noise = np.random.normal(0, sigma_obs, size=true_probs.shape)
             released_probs = true_probs + noise
             
+            # INCREASED DIFFICULTY: Attacker cannot read raw probability fractions perfectly.
+            # We add continuous random API noise to the released values to create semantic drift.
+            api_noise = np.random.normal(0, 0.001, size=true_probs.shape)
+            adversary_obs = released_probs + api_noise
+            
+            # Log-Likelihood Updates for each parallel world
             for m_idx in range(M_worlds):
-                # Server observes distance on standard probabilities
-                res_obs = released_probs - world_probs[m_idx]
+                # Server assumes continuous composition math
+                res_obs = adversary_obs - world_probs[m_idx]
                 server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
                 
                 # Attacker observes distance on raw scaled logits
-                res_hid = (released_probs - norm_logits[m_idx]) / (sigma_hidden + 1e-9) 
-                true_log_accum[m_idx] += -0.5 * np.sum(res_hid**2)
+                res_hid = adversary_obs - norm_logits[m_idx] 
+                true_log_accum[m_idx] += -0.5 * np.sum(res_hid**2) / (sigma_hidden + 1e-9)
                 
-            # Apply the NaN-proof safe softmax
+            # Compute posteriors via Safe Softmax
             server_belief = safe_softmax(server_log_accum)
             true_adversary_belief = safe_softmax(true_log_accum)
             
             gap = np.max(true_adversary_belief) - np.max(server_belief)
             
-            print(f"{t:<6} | {np.max(server_belief):<25.4f} | {np.max(true_adversary_belief):<28.4f} | {gap*100:<10.2f}%")
+            print(f"  [POSTERIOR] Server Belief on Secret : {server_belief[secret_index]:.4f}")
+            print(f"  [POSTERIOR] True Attacker Belief    : {true_adversary_belief[secret_index]:.4f}")
+            
+            summary_table.append((t, np.max(server_belief), np.max(true_adversary_belief), gap))
+
+        # ----------------------------------------------------------------------
+        # 4. FINAL TELEMETRY SUMMARY
+        # ----------------------------------------------------------------------
+        print("\n" + "="*80)
+        print(" FINAL BENCHMARK SUMMARY TABLE")
+        print("="*80)
+        print(f"{'Turn':<6} | {'Server Expected Belief':<25} | {'True Attack Vector Belief':<28} | {'Gap (%)':<10}")
+        print("-" * 80)
+        
+        for row in summary_table:
+            print(f"{row[0]:<6} | {row[1]:<25.4f} | {row[2]:<28.4f} | {row[3]*100:<10.2f}%")
 
         print("\n[CONCLUSION] Telemetry proves that treating LLM outputs as continuous")
         print("values fails to account for the jagged, discrete distribution in raw logits.")
