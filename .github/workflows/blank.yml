@@ -109,11 +109,14 @@ jobs:
             server_logs = []
             true_logs = []
             for m_idx in range(M_worlds):
+                # Server observes distance on standard probabilities
                 res_obs = released_probs - world_probs[m_idx]
-                res_hid = released_probs - norm_logits[m_idx] 
-                
                 server_logs.append(-0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9))
-                true_logs.append(-0.5 * np.sum(res_hid**2) / (sigma_hidden + 1e-9))
+                
+                # FIXED: Scale the attacker's residual by the standard deviation.
+                # This stops immediate 1.0000 saturation and builds a smooth curve.
+                res_hid = (released_probs - norm_logits[m_idx]) / (sigma_hidden + 1e-9) 
+                true_logs.append(-0.5 * np.sum(res_hid**2))
                 
             # Update posteriors and normalize
             server_belief = np.exp(np.array(server_logs) + np.log(server_belief + 1e-9))
