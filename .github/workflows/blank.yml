@@ -76,7 +76,7 @@ jobs:
         world_probs = np.stack(world_probs)
         world_raw_logits = np.stack(world_raw_logits)
 
-        # CRITICAL FIX: Use Min-Max scaling to prevent negative sum division errors
+        # Min-Max scaling to prevent negative sum division errors
         min_logits = world_raw_logits.min(axis=1, keepdims=True)
         max_logits = world_raw_logits.max(axis=1, keepdims=True)
         norm_logits = (world_raw_logits - min_logits) / (max_logits - min_logits + 1e-9)
@@ -92,6 +92,16 @@ jobs:
         true_adversary_belief = np.ones(M_worlds) / M_worlds
         secret_index = 0
 
+        # Helper function for the Log-Sum-Exp trick to prevent NaN underflows
+        def safe_softmax(logs):
+            max_log = np.max(logs)
+            exps = np.exp(logs - max_log)
+            return exps / np.sum(exps)
+
+        # Accumulated log-likelihoods over turns
+        server_log_accum = np.zeros(M_worlds)
+        true_log_accum = np.zeros(M_worlds)
+
         for t in range(1, turns + 1):
             obs_variance = np.var(world_probs, axis=0).max()
             hidden_variance = np.var(norm_logits, axis=0).max()
@@ -102,28 +112,21 @@ jobs:
             
             true_probs = world_probs[secret_index]
             
-            # Generate the noise on the server's expected scale
             noise = np.random.normal(0, sigma_obs, size=true_probs.shape)
             released_probs = true_probs + noise
             
-            server_logs = []
-            true_logs = []
             for m_idx in range(M_worlds):
                 # Server observes distance on standard probabilities
                 res_obs = released_probs - world_probs[m_idx]
-                server_logs.append(-0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9))
+                server_log_accum[m_idx] += -0.5 * np.sum(res_obs**2) / (sigma_obs + 1e-9)
                 
-                # FIXED: Scale the attacker's residual by the standard deviation.
-                # This stops immediate 1.0000 saturation and builds a smooth curve.
+                # Attacker observes distance on raw scaled logits
                 res_hid = (released_probs - norm_logits[m_idx]) / (sigma_hidden + 1e-9) 
-                true_logs.append(-0.5 * np.sum(res_hid**2))
+                true_log_accum[m_idx] += -0.5 * np.sum(res_hid**2)
                 
-            # Update posteriors and normalize
-            server_belief = np.exp(np.array(server_logs) + np.log(server_belief + 1e-9))
-            server_belief /= np.sum(server_belief)
-            
-            true_adversary_belief = np.exp(np.array(true_logs) + np.log(true_adversary_belief + 1e-9))
-            true_adversary_belief /= np.sum(true_adversary_belief)
+            # Apply the NaN-proof safe softmax
+            server_belief = safe_softmax(server_log_accum)
+            true_adversary_belief = safe_softmax(true_log_accum)
             
             gap = np.max(true_adversary_belief) - np.max(server_belief)
             
